@@ -1,6 +1,5 @@
 import os
 import sys
-from mmgp import offload
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xcodec_mini_infer'))
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xcodec_mini_infer', 'descriptaudiocodec'))
 import re
@@ -16,13 +15,48 @@ import torchaudio
 from torchaudio.transforms import Resample
 import soundfile as sf
 from einops import rearrange
-from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessor, LogitsProcessorList
+from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessor, LogitsProcessorList, BitsAndBytesConfig
 from omegaconf import OmegaConf
 from codecmanipulator import CodecManipulator
 from mmtokenizer import _MMSentencePieceTokenizer
 from models.soundstream_hubert_new import SoundStream
 from vocoder import build_codec_model, process_audio
 from post_process_audio import replace_low_freq_with_energy_matched
+
+def load_optimized_model(model_path, quantization, attention):
+    print(f"Loading optimized model from {model_path} with quantization {quantization} and attention {attention}")
+    bnb_config = None
+    torch_dtype = torch.bfloat16
+    device = torch.device(f"cuda:{args.cuda_idx}" if torch.cuda.is_available() else "cpu")
+
+    if quantization == "int4" or quantization == "nf4":
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type=quantization
+        )
+    elif quantization == "int8":
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            device_map={"": device}  # Specify device mapping for int8
+        )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        quantization_config=bnb_config,
+        torch_dtype=torch_dtype,
+        attn_implementation=attention,
+        cache_dir="./models",
+        device_map={"": device} if quantization == "int8" else None  # Only set device_map for int8
+    )
+
+    if quantization != "int8":
+        model.to(device)
+
+    return model
+
+print("Starting music generation pipeline...")
+
 parser = argparse.ArgumentParser()
 # Model Configuration:
 parser.add_argument("--stage1_model", type=str, default="m-a-p/YuE-s1-7B-anneal-en-cot", help="The model checkpoint path or identifier for the Stage 1 model.")
@@ -31,8 +65,8 @@ parser.add_argument("--max_new_tokens", type=int, default=3000, help="The maximu
 parser.add_argument("--run_n_segments", type=int, default=2, help="The number of segments to process during the generation.")
 parser.add_argument("--stage2_batch_size", type=int, default=4, help="The batch size used in Stage 2 inference.")
 # Prompt
-parser.add_argument("--genre_txt", type=str, help="The file path to a text file containing genre tags that describe the musical style or characteristics (e.g., instrumental, genre, mood, vocal timbre, vocal gender). This is used as part of the generation prompt.")
-parser.add_argument("--lyrics_txt", type=str, help="The file path to a text file containing the lyrics for the music generation. These lyrics will be processed and split into structured segments to guide the generation process.")
+parser.add_argument("--genre_txt", type=str, required=True, help="The file path to a text file containing genre tags that describe the musical style or characteristics (e.g., instrumental, genre, mood, vocal timbre, vocal gender). This is used as part of the generation prompt.")
+parser.add_argument("--lyrics_txt", type=str, required=True, help="The file path to a text file containing the lyrics for the music generation. These lyrics will be processed and split into structured segments to guide the generation process.")
 parser.add_argument("--use_audio_prompt", action="store_true", help="If set, the model will use an audio file as a prompt during generation. The audio file should be specified using --audio_prompt_path.")
 parser.add_argument("--audio_prompt_path", type=str, default="", help="The file path to an audio file to use as a reference prompt when --use_audio_prompt is enabled.")
 parser.add_argument("--prompt_start_time", type=float, default=0.0, help="The start time in seconds to extract the audio prompt from the given audio file.")
@@ -40,7 +74,7 @@ parser.add_argument("--prompt_end_time", type=float, default=30.0, help="The end
 parser.add_argument("--use_dual_tracks_prompt", action="store_true", help="If set, the model will use dual tracks as a prompt during generation. The vocal and instrumental files should be specified using --vocal_track_prompt_path and --instrumental_track_prompt_path.")
 parser.add_argument("--vocal_track_prompt_path", type=str, default="", help="The file path to a vocal track file to use as a reference prompt when --use_dual_tracks_prompt is enabled.")
 parser.add_argument("--instrumental_track_prompt_path", type=str, default="", help="The file path to an instrumental track file to use as a reference prompt when --use_dual_tracks_prompt is enabled.")
-# Output 
+# Output
 parser.add_argument("--output_dir", type=str, default="./output", help="The directory where generated outputs will be saved.")
 parser.add_argument("--keep_intermediate", action="store_true", help="If set, intermediate outputs will be saved during processing.")
 parser.add_argument("--disable_offload_model", action="store_true", help="If set, the model will not be offloaded from the GPU to CPU after Stage 1 inference.")
@@ -53,41 +87,18 @@ parser.add_argument('--config_path', type=str, default='./xcodec_mini_infer/deco
 parser.add_argument('--vocal_decoder_path', type=str, default='./xcodec_mini_infer/decoders/decoder_131000.pth', help='Path to Vocos decoder weights.')
 parser.add_argument('--inst_decoder_path', type=str, default='./xcodec_mini_infer/decoders/decoder_151000.pth', help='Path to Vocos decoder weights.')
 parser.add_argument('-r', '--rescale', action='store_true', help='Rescale output to avoid clipping.')
-parser.add_argument("--profile", type=int, default=3)
-parser.add_argument("--verbose", type=int, default=1)
-parser.add_argument("--compile", action="store_true")
-parser.add_argument("--icl", action="store_true")
+
+# Quantization
+parser.add_argument("--quantization_stage1", type=str, default="bf16",
+                    choices=["bf16", "int8", "int4", "nf4"],
+                    help="The quantization mode of the model stage 1.")
+parser.add_argument("--quantization_stage2", type=str, default="bf16",
+                    choices=["bf16", "int8", "int4", "nf4"],
+                    help="The quantization mode of the model stage 2.")
 
 
 args = parser.parse_args()
-profile = args.profile
-compile = args.compile
-use_icl = args.icl
-
-if use_icl:
-    args.stage1_model="m-a-p/YuE-s1-7B-anneal-en-icl"
-else:
-    args.stage1_model="m-a-p/YuE-s1-7B-anneal-en-cot"
-
-args.stage2_model="m-a-p/YuE-s2-1B-general"
-args.genre_txt="prompt_examples/genrerock.txt"
-args.lyrics_txt="prompt_examples/lastxmas.txt"
-args.run_n_segments=2
-args.stage2_batch_size=12 if profile==1 else 4
-args.output_dir= "./output"
-args.cuda_idx =  0
-args.max_new_tokens = 3000 
-
-args.stage1_model="m-a-p/YuE-s1-7B-anneal-en-cot"
-args.stage2_model="m-a-p/YuE-s2-1B-general"
-args.genre_txt="prompt_examples/genrerock.txt"
-args.lyrics_txt="prompt_examples/lastxmas.txt"
-args.run_n_segments=2
-args.stage2_batch_size=12 if profile==1 else 4
-args.output_dir= "./output"
-args.cuda_idx =  0
-args.max_new_tokens = 3000 
-
+print("Parsed command line arguments")
 
 if args.use_audio_prompt and not args.audio_prompt_path:
     raise FileNotFoundError("Please offer audio prompt filepath using '--audio_prompt_path', when you enable 'use_audio_prompt'!")
@@ -101,46 +112,43 @@ stage1_output_dir = os.path.join(args.output_dir, f"stage1")
 stage2_output_dir = stage1_output_dir.replace('stage1', 'stage2')
 os.makedirs(stage1_output_dir, exist_ok=True)
 os.makedirs(stage2_output_dir, exist_ok=True)
-def seed_everything(seed=42): 
-    random.seed(seed) 
-    np.random.seed(seed) 
-    torch.manual_seed(seed) 
-    torch.cuda.manual_seed_all(seed) 
+print(f"Created output directories: {stage1_output_dir}, {stage2_output_dir}")
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 seed_everything(args.seed)
+print(f"Set random seed to {args.seed}")
+
 # load tokenizer and model
 device = torch.device(f"cuda:{cuda_idx}" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+print("Loading tokenizer...")
 mmtokenizer = _MMSentencePieceTokenizer("./mm_tokenizer_v0.2_hf/tokenizer.model")
-model = AutoModelForCausalLM.from_pretrained(
-    stage1_model, 
-    torch_dtype=torch.bfloat16,
-    )
-# to device, if gpu is available
-model.to("cpu")
+
+print(f"Loading Stage 1 model from {stage1_model}...")
+model = load_optimized_model(stage1_model, args.quantization_stage1, "flash_attention_2")
 model.eval()
 
-model_stage2 = AutoModelForCausalLM.from_pretrained(
-    stage2_model, 
-    torch_dtype=torch.float16,
-    )
-model_stage2.to("cpu")
-model_stage2.eval()
-pipe = { "transformer" :model , "stage2" :model_stage2    }
+if torch.__version__ >= "2.0.0":
+    print("Compiling model with torch.compile()...")
+    model = torch.compile(model)
 
-quantizeTransformer = profile == 3 or profile == 4 or profile == 5 
-
+print("Loading codec tools and models...")
 codectool = CodecManipulator("xcodec", 0, 1)
 codectool_stage2 = CodecManipulator("xcodec", 0, 8)
 model_config = OmegaConf.load(args.basic_model_config)
 codec_model = eval(model_config.generator.name)(**model_config.generator.config).to(device)
-parameter_dict = torch.load(args.resume_path, map_location='cpu')
+parameter_dict = torch.load(args.resume_path, map_location='cpu', weights_only=False)
 codec_model.load_state_dict(parameter_dict['codec_model'])
 codec_model.to(device)
 codec_model.eval()
 
-offload.profile(pipe, profile_no = profile, quantizeTransformer= quantizeTransformer, compile = compile, verboseLevel= args.verbose ) 
-    
 class BlockTokenRangeProcessor(LogitsProcessor):
     def __init__(self, start_id, end_id):
         self.blocked_token_ids = list(range(start_id, end_id))
@@ -150,16 +158,19 @@ class BlockTokenRangeProcessor(LogitsProcessor):
         return scores
 
 def load_audio_mono(filepath, sampling_rate=16000):
+    print(f"Loading audio file: {filepath}")
     audio, sr = torchaudio.load(filepath)
     # Convert to mono
     audio = torch.mean(audio, dim=0, keepdim=True)
     # Resample if needed
     if sr != sampling_rate:
+        print(f"Resampling audio from {sr}Hz to {sampling_rate}Hz")
         resampler = Resample(orig_freq=sr, new_freq=sampling_rate)
         audio = resampler(audio)
     return audio
 
 def encode_audio(codec_model, audio_prompt, device, target_bw=0.5):
+    print("Encoding audio prompt...")
     if len(audio_prompt.shape) < 3:
         audio_prompt.unsqueeze_(0)
     with torch.no_grad():
@@ -169,9 +180,11 @@ def encode_audio(codec_model, audio_prompt, device, target_bw=0.5):
     return raw_codes
 
 def split_lyrics(lyrics):
+    print("Splitting lyrics into segments...")
     pattern = r"\[(\w+)\](.*?)\n(?=\[|\Z)"
     segments = re.findall(pattern, lyrics, re.DOTALL)
     structured_lyrics = [f"[{seg[0]}]\n{seg[1].strip()}\n\n" for seg in segments]
+    print(f"Found {len(structured_lyrics)} lyric segments")
     return structured_lyrics
 
 # Call the function and print the result
@@ -179,6 +192,7 @@ stage1_output_set = []
 # Tips:
 # genre tags support instrumental，genre，mood，vocal timbr and vocal gender
 # all kinds of tags are needed
+print("Loading genre tags and lyrics...")
 with open(args.genre_txt) as f:
     genres = f.read().strip()
 with open(args.lyrics_txt) as f:
@@ -188,26 +202,33 @@ full_lyrics = "\n".join(lyrics)
 prompt_texts = [f"Generate music from the given lyrics segment by segment.\n[Genre] {genres}\n{full_lyrics}"]
 prompt_texts += lyrics
 
+print(f"Genre tags: {genres}")
+print(f"Number of lyric segments: {len(lyrics)}")
 
 random_id = uuid.uuid4()
 output_seq = None
 # Here is suggested decoding config
 top_p = 0.93
 temperature = 1.0
-repetition_penalty = 1.2
+repetition_penalty = 1.0
 # special tokens
 start_of_segment = mmtokenizer.tokenize('[start_of_segment]')
 end_of_segment = mmtokenizer.tokenize('[end_of_segment]')
 # Format text prompt
 run_n_segments = min(args.run_n_segments+1, len(lyrics))
-for i, p in enumerate(tqdm(prompt_texts[:run_n_segments])):
+print(f"Will process {run_n_segments-1} segments")
+
+for i, p in enumerate(tqdm(prompt_texts[:run_n_segments], desc="Stage1 inference...")):
+    print(f"\nProcessing segment {i}/{run_n_segments-1}")
     section_text = p.replace('[start_of_segment]', '').replace('[end_of_segment]', '')
     guidance_scale = 1.5 if i <=1 else 1.2
     if i==0:
         continue
     if i==1:
         if args.use_dual_tracks_prompt or args.use_audio_prompt:
+            print("Processing audio prompt...")
             if args.use_dual_tracks_prompt:
+                print("Using dual tracks prompt")
                 vocals_ids = load_audio_mono(args.vocal_track_prompt_path)
                 instrumental_ids = load_audio_mono(args.instrumental_track_prompt_path)
                 vocals_ids = encode_audio(codec_model, vocals_ids, device, target_bw=0.5)
@@ -218,6 +239,7 @@ for i, p in enumerate(tqdm(prompt_texts[:run_n_segments])):
                 audio_prompt_codec = ids_segment_interleaved[int(args.prompt_start_time*50*2): int(args.prompt_end_time*50*2)]
                 audio_prompt_codec = audio_prompt_codec.tolist()
             elif args.use_audio_prompt:
+                print("Using single audio prompt")
                 audio_prompt = load_audio_mono(args.audio_prompt_path)
                 raw_codes = encode_audio(codec_model, audio_prompt, device, target_bw=0.5)
                 # Format audio prompt
@@ -232,7 +254,7 @@ for i, p in enumerate(tqdm(prompt_texts[:run_n_segments])):
     else:
         prompt_ids = end_of_segment + start_of_segment + mmtokenizer.tokenize(section_text) + [mmtokenizer.soa] + codectool.sep_ids
 
-    prompt_ids = torch.as_tensor(prompt_ids).unsqueeze(0).to(device) 
+    prompt_ids = torch.as_tensor(prompt_ids).unsqueeze(0).to(device)
     input_ids = torch.cat([raw_output, prompt_ids], dim=1) if i > 1 else prompt_ids
     # Use window slicing in case output sequence exceeds the context of model
     max_context = 16384-max_new_tokens-1
@@ -240,14 +262,15 @@ for i, p in enumerate(tqdm(prompt_texts[:run_n_segments])):
         print(f'Section {i}: output length {input_ids.shape[-1]} exceeding context length {max_context}, now using the last {max_context} tokens.')
         input_ids = input_ids[:, -(max_context):]
     with torch.no_grad():
+        print(f"Generating tokens for segment {i}...")
         output_seq = model.generate(
-            input_ids=input_ids, 
-            max_new_tokens=max_new_tokens, 
-            min_new_tokens=100, 
-            do_sample=True, 
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=100,
+            do_sample=True,
             top_p=top_p,
-            temperature=temperature, 
-            repetition_penalty=repetition_penalty, 
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
             eos_token_id=mmtokenizer.eoa,
             pad_token_id=mmtokenizer.eoa,
             logits_processor=LogitsProcessorList([BlockTokenRangeProcessor(0, 32002), BlockTokenRangeProcessor(32016, 32016)]),
@@ -261,7 +284,10 @@ for i, p in enumerate(tqdm(prompt_texts[:run_n_segments])):
     else:
         raw_output = output_seq
 
+print("Stage 1 generation complete")
+
 # save raw output and check sanity
+print("Processing Stage 1 outputs...")
 ids = raw_output[0].cpu().numpy()
 soa_idx = np.where(ids == mmtokenizer.soa)[0].tolist()
 eoa_idx = np.where(ids == mmtokenizer.eoa)[0].tolist()
@@ -272,6 +298,7 @@ vocals = []
 instrumentals = []
 range_begin = 1 if args.use_audio_prompt or args.use_dual_tracks_prompt else 0
 for i in range(range_begin, len(soa_idx)):
+    print(f"Processing segment {i} of {len(soa_idx)}")
     codec_ids = ids[soa_idx[i]+1:eoa_idx[i]]
     if codec_ids[0] == 32016:
         codec_ids = codec_ids[1:]
@@ -284,6 +311,7 @@ vocals = np.concatenate(vocals, axis=1)
 instrumentals = np.concatenate(instrumentals, axis=1)
 vocal_save_path = os.path.join(stage1_output_dir, f"{genres.replace(' ', '-')}_tp{top_p}_T{temperature}_rp{repetition_penalty}_maxtk{max_new_tokens}_{random_id}_vtrack".replace('.', '@')+'.npy')
 inst_save_path = os.path.join(stage1_output_dir, f"{genres.replace(' ', '-')}_tp{top_p}_T{temperature}_rp{repetition_penalty}_maxtk{max_new_tokens}_{random_id}_itrack".replace('.', '@')+'.npy')
+print(f"Saving Stage 1 outputs to:\n{vocal_save_path}\n{inst_save_path}")
 np.save(vocal_save_path, vocals)
 np.save(inst_save_path, instrumentals)
 stage1_output_set.append(vocal_save_path)
@@ -291,29 +319,31 @@ stage1_output_set.append(inst_save_path)
 
 
 # offload model
-# if not args.disable_offload_model:
-#     model.cpu()
-#     del model
-#     torch.cuda.empty_cache()
+if not args.disable_offload_model:
+    print("Offloading Stage 1 model from GPU...")
+    model.cpu()
+    del model
+    torch.cuda.empty_cache()
 
-print("Stage 2 inference...")
-# model_stage2 = AutoModelForCausalLM.from_pretrained(
-#     stage2_model, 
-#     torch_dtype=torch.float16,
-#     attn_implementation="flash_attention_2"
-#     )
-# model_stage2.to(device)
-# model_stage2.eval()
+print("\nStarting Stage 2 inference...")
+print(f"Loading Stage 2 model from {stage2_model}...")
+model_stage2 = load_optimized_model(stage2_model, args.quantization_stage2, "flash_attention_2")
+model_stage2.eval()
+
+if torch.__version__ >= "2.0.0":
+    print("Compiling Stage 2 model...")
+    model_stage2 = torch.compile(model_stage2)
 
 def stage2_generate(model, prompt, batch_size=16):
+    print(f"Stage 2 generation with batch size {batch_size}")
     codec_ids = codectool.unflatten(prompt, n_quantizer=1)
     codec_ids = codectool.offset_tok_ids(
-                    codec_ids, 
-                    global_offset=codectool.global_offset, 
-                    codebook_size=codectool.codebook_size, 
-                    num_codebooks=codectool.num_codebooks, 
+                    codec_ids,
+                    global_offset=codectool.global_offset,
+                    codebook_size=codectool.codebook_size,
+                    num_codebooks=codectool.num_codebooks,
                 ).astype(np.int32)
-    
+
     # Prepare prompt_ids based on batch size or single input
     if batch_size > 1:
         codec_list = []
@@ -342,24 +372,27 @@ def stage2_generate(model, prompt, batch_size=16):
     codec_ids = torch.as_tensor(codec_ids).to(device)
     prompt_ids = torch.as_tensor(prompt_ids).to(device)
     len_prompt = prompt_ids.shape[-1]
-    
+
     block_list = LogitsProcessorList([BlockTokenRangeProcessor(0, 46358), BlockTokenRangeProcessor(53526, mmtokenizer.vocab_size)])
 
     # Teacher forcing generate loop
+    print("Starting teacher forcing generation loop...")
     for frames_idx in range(codec_ids.shape[1]):
+        if frames_idx % 100 == 0:
+            print(f"Processing frame {frames_idx}/{codec_ids.shape[1]}")
         cb0 = codec_ids[:, frames_idx:frames_idx+1]
         prompt_ids = torch.cat([prompt_ids, cb0], dim=1)
         input_ids = prompt_ids
 
         with torch.no_grad():
-            stage2_output = model.generate(input_ids=input_ids, 
+            stage2_output = model.generate(input_ids=input_ids,
                 min_new_tokens=7,
                 max_new_tokens=7,
                 eos_token_id=mmtokenizer.eoa,
                 pad_token_id=mmtokenizer.eoa,
                 logits_processor=block_list,
             )
-        
+
         assert stage2_output.shape[1] - prompt_ids.shape[1] == 7, f"output new tokens={stage2_output.shape[1]-prompt_ids.shape[1]}"
         prompt_ids = stage2_output
 
@@ -374,21 +407,25 @@ def stage2_generate(model, prompt, batch_size=16):
     return output
 
 def stage2_inference(model, stage1_output_set, stage2_output_dir, batch_size=4):
+    print(f"Starting Stage 2 inference with batch size {batch_size}")
     stage2_result = []
     for i in tqdm(range(len(stage1_output_set))):
         output_filename = os.path.join(stage2_output_dir, os.path.basename(stage1_output_set[i]))
-        
+
         if os.path.exists(output_filename):
             print(f'{output_filename} stage2 has done.')
             continue
-        
+
+        print(f"Processing file {i+1}/{len(stage1_output_set)}: {stage1_output_set[i]}")
         # Load the prompt
         prompt = np.load(stage1_output_set[i]).astype(np.int32)
-        
+
         # Only accept 6s segments
         output_duration = prompt.shape[-1] // 50 // 6 * 6
         num_batch = output_duration // 6
-        
+
+        print(f"Output duration: {output_duration}s, Number of batches: {num_batch}")
+
         if num_batch <= batch_size:
             # If num_batch is less than or equal to batch_size, we can infer the entire prompt at once
             output = stage2_generate(model, prompt[:, :output_duration*50], batch_size=num_batch)
@@ -396,8 +433,10 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, batch_size=4):
             # If num_batch is greater than batch_size, process in chunks of batch_size
             segments = []
             num_segments = (num_batch // batch_size) + (1 if num_batch % batch_size != 0 else 0)
+            print(f"Processing in {num_segments} segments")
 
             for seg in range(num_segments):
+                print(f"Processing segment {seg+1}/{num_segments}")
                 start_idx = seg * batch_size * 300
                 # Ensure the end_idx does not exceed the available length
                 end_idx = min((seg + 1) * batch_size * 300, output_duration*50)  # Adjust the last segment
@@ -411,15 +450,17 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, batch_size=4):
 
             # Concatenate all the segments
             output = np.concatenate(segments, axis=0)
-        
+
         # Process the ending part of the prompt
         if output_duration*50 != prompt.shape[-1]:
+            print("Processing ending segment...")
             ending = stage2_generate(model, prompt[:, output_duration*50:], batch_size=1)
             output = np.concatenate([output, ending], axis=0)
         output = codectool_stage2.ids2npy(output)
 
         # Fix invalid codes (a dirty solution, which may harm the quality of audio)
         # We are trying to find better one
+        print("Fixing invalid codes...")
         fixed_output = copy.deepcopy(output)
         for i, line in enumerate(output):
             for j, element in enumerate(line):
@@ -428,12 +469,13 @@ def stage2_inference(model, stage1_output_set, stage2_output_dir, batch_size=4):
                     most_frequant = sorted(counter.items(), key=lambda x: x[1], reverse=True)[0][0]
                     fixed_output[i, j] = most_frequant
         # save output
+        print(f"Saving Stage 2 output to {output_filename}")
         np.save(output_filename, fixed_output)
         stage2_result.append(output_filename)
     return stage2_result
 
 stage2_result = stage2_inference(model_stage2, stage1_output_set, stage2_output_dir, batch_size=args.stage2_batch_size)
-print(stage2_result)
+print("Stage 2 outputs:", stage2_result)
 print('Stage 2 DONE.\n')
 # convert audio tokens to audio
 def save_audio(wav: torch.Tensor, path, sample_rate: int, rescale: bool = False):
@@ -445,22 +487,26 @@ def save_audio(wav: torch.Tensor, path, sample_rate: int, rescale: bool = False)
     wav = wav * min(limit / max_val, 1) if rescale else wav.clamp(-limit, limit)
     torchaudio.save(str(path), wav, sample_rate=sample_rate, encoding='PCM_S', bits_per_sample=16)
 # reconstruct tracks
+print("Reconstructing audio tracks...")
 recons_output_dir = os.path.join(args.output_dir, "recons")
 recons_mix_dir = os.path.join(recons_output_dir, 'mix')
 os.makedirs(recons_mix_dir, exist_ok=True)
 tracks = []
 for npy in stage2_result:
+    print(f"Processing {npy}")
     codec_result = np.load(npy)
     decodec_rlt=[]
     with torch.no_grad():
         decoded_waveform = codec_model.decode(torch.as_tensor(codec_result.astype(np.int16), dtype=torch.long).unsqueeze(0).permute(1, 0, 2).to(device))
     decoded_waveform = decoded_waveform.cpu().squeeze(0)
-    decodec_rlt.append(torch.as_tensor(decoded_waveform, device ="cpu"))
+    decodec_rlt.append(torch.as_tensor(decoded_waveform))
     decodec_rlt = torch.cat(decodec_rlt, dim=-1)
     save_path = os.path.join(recons_output_dir, os.path.splitext(os.path.basename(npy))[0] + ".mp3")
     tracks.append(save_path)
+    print(f"Saving reconstructed audio to {save_path}")
     save_audio(decodec_rlt, save_path, 16000)
 # mix tracks
+print("Mixing tracks...")
 for inst_path in tracks:
     try:
         if (inst_path.endswith('.wav') or inst_path.endswith('.mp3')) \
@@ -471,12 +517,13 @@ for inst_path in tracks:
                 continue
             # mix
             recons_mix = os.path.join(recons_mix_dir, os.path.basename(inst_path).replace('_itrack', '_mixed'))
+            print(f"Creating mix: {recons_mix}")
             vocal_stem, sr = sf.read(inst_path)
             instrumental_stem, _ = sf.read(vocal_path)
             mix_stem = (vocal_stem + instrumental_stem) / 1
             sf.write(recons_mix, mix_stem, sr)
     except Exception as e:
-        print(e)
+        print(f"Error mixing tracks: {e}")
 
 # vocoder to upsample audios
 vocal_decoder, inst_decoder = build_codec_model(args.config_path, args.vocal_decoder_path, args.inst_decoder_path)

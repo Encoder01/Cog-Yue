@@ -83,29 +83,6 @@ class Predictor(BasePredictor):
             default="bf16",
             choices=["bf16", "int8"],
         ),
-        use_dual_tracks_prompt: bool = Input(
-            description="Enable dual-track ICL mode with separate vocal and instrumental tracks",
-            default=False
-        ),
-        vocal_track_prompt: Path = Input(
-            description="Path to the vocal track audio file for dual-track ICL mode",
-            default=None
-        ),
-        instrumental_track_prompt: Path = Input(
-            description="Path to the instrumental track audio file for dual-track ICL mode",
-            default=None
-        ),
-        prompt_start_time: int = Input(
-            description="Start time in seconds for the audio prompt",
-            default=0,
-            ge=0
-        ),
-        prompt_end_time: int = Input(
-            description="End time in seconds for the audio prompt",
-            default=30,
-            ge=0,
-            le=120
-        ),
     ) -> List[Path]:
         """Run YuE inference on the provided inputs"""
         seed = self.seed_or_random_seed(seed)
@@ -125,61 +102,87 @@ class Predictor(BasePredictor):
         if not genre_description.strip():
             raise ValueError("Genre description cannot be empty")
 
-        # Validate dual-track mode inputs
-        if use_dual_tracks_prompt:
-            if not vocal_track_prompt or not instrumental_track_prompt:
-                raise ValueError("Both vocal and instrumental track prompts are required for dual-track mode")
-            if not os.path.exists(vocal_track_prompt):
-                raise ValueError(f"Vocal track file does not exist: {vocal_track_prompt}")
-            if not os.path.exists(instrumental_track_prompt):
-                raise ValueError(f"Instrumental track file does not exist: {instrumental_track_prompt}")
-            if prompt_end_time <= prompt_start_time:
-                raise ValueError("prompt_end_time must be greater than prompt_start_time")
+        # Create temporary files for genre and lyrics
+        def create_temp_file(content: str, prefix: str) -> str:
+            temp_file = tempfile.NamedTemporaryFile(
+                delete=False, mode="w", prefix=prefix, suffix=".txt"
+            )
+            content = content.strip() + "\n\n"
+            content = content.replace("\r\n", "\n").replace("\r", "\n")
+            temp_file.write(content)
+            temp_file.close()
+            return temp_file.name
 
-        # Create temporary directory for outputs
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Write inputs to files
-            genre_file = os.path.join(temp_dir, "genre.txt")
-            lyrics_file = os.path.join(temp_dir, "lyrics.txt")
-            with open(genre_file, "w", encoding="utf-8") as f:
-                f.write(genre_description)
-            with open(lyrics_file, "w", encoding="utf-8") as f:
-                f.write(lyrics)
+        genre_file = create_temp_file(genre_description, "genre_")
+        lyrics_file = create_temp_file(lyrics, "lyrics_")
 
-            # Prepare command
-            cmd = [
-                "python",
-                "/src/inference/infer.py",
-                "--cuda_idx", "0",
-                "--stage1_model", self.get_stage1_model(quantization_stage1),
-                "--stage2_model", self.get_stage2_model(quantization_stage2),
-                "--genre_txt", genre_file,
-                "--lyrics_txt", lyrics_file,
-                "--run_n_segments", str(num_segments),
-                "--stage2_batch_size", "4",
-                "--output_dir", temp_dir,
-                "--max_new_tokens", str(max_new_tokens),
-            ]
+        # Setup output directory
+        output_dir = "/src/output"
+        os.makedirs(output_dir, exist_ok=True)
 
-            # Add seed if specified
-            if seed is not None:
-                cmd.extend(["--seed", str(seed)])
+        # Empty output directory
+        for item in os.listdir(output_dir):
+            path = os.path.join(output_dir, item)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
 
-            # Add dual-track mode parameters if enabled
-            if use_dual_tracks_prompt:
-                cmd.extend([
-                    "--use_dual_tracks_prompt",
-                    "--vocal_track_prompt_path", str(vocal_track_prompt),
-                    "--instrumental_track_prompt_path", str(instrumental_track_prompt),
-                    "--prompt_start_time", str(prompt_start_time),
-                    "--prompt_end_time", str(prompt_end_time)
-                ])
+        try:
+            # Change to inference directory
+            os.chdir("./inference")
+
+            # Quantisation to model mapping
+            stage_1_model = {
+                "bf16": "m-a-p/YuE-s1-7B-anneal-en-cot",
+                "int8": "Alissonerdx/YuE-s1-7B-anneal-en-cot-int8",
+                "nf4": "Alissonerdx/YuE-s1-7B-anneal-en-cot-nf4",
+            }
+            stage_2_model = {
+                "bf16": "m-a-p/YuE-s2-1B-general",
+                "int8": "Alissonerdx/YuE-s2-1B-general-int8",
+            }
+
+            print(f"Stage 1 model: {stage_1_model[quantization_stage1]}")
+            print(f"Stage 2 model: {stage_2_model[quantization_stage2]}")
 
             # Run inference
-            subprocess.run(cmd, check=True)
+            command = [
+                "python",
+                "infer.py",
+                "--stage1_model",
+                stage_1_model[quantization_stage1],
+                "--stage2_model",
+                stage_2_model[quantization_stage2],
+                "--genre_txt",
+                genre_file,
+                "--lyrics_txt",
+                lyrics_file,
+                "--run_n_segments",
+                str(num_segments),
+                "--stage2_batch_size",
+                "4",
+                "--output_dir",
+                output_dir,
+                "--cuda_idx",
+                "0",
+                "--max_new_tokens",
+                str(max_new_tokens),
+                "--seed",
+                str(seed),
+                "--quantization_stage1",
+                quantization_stage1,
+                "--quantization_stage2",
+                quantization_stage2,
+            ]
+
+            subprocess.run(command, check=True)
+
+            # Change back to root directory
+            os.chdir("..")
 
             # Find output files in vocoder/mix directory and rename to output_N.mp3
-            mix_dir = os.path.join(temp_dir, "vocoder", "mix")
+            mix_dir = os.path.join(output_dir, "vocoder", "mix")
             output_files = []
             if os.path.exists(mix_dir):
                 mp3_files = [f for f in os.listdir(mix_dir) if f.endswith(".mp3")]
@@ -194,6 +197,11 @@ class Predictor(BasePredictor):
 
             return output_files
 
+        finally:
+            # Cleanup temp files
+            os.remove(genre_file)
+            os.remove(lyrics_file)
+
     def seed_or_random_seed(self, seed: int | None) -> int:
         # Max seed is 2147483647
         if not seed or seed <= 0:
@@ -201,18 +209,3 @@ class Predictor(BasePredictor):
 
         print(f"Using seed: {seed}\n")
         return seed
-
-    def get_stage1_model(self, quantization_stage1: str) -> str:
-        stage_1_model = {
-            "bf16": "m-a-p/YuE-s1-7B-anneal-en-cot",
-            "int8": "Alissonerdx/YuE-s1-7B-anneal-en-cot-int8",
-            "nf4": "Alissonerdx/YuE-s1-7B-anneal-en-cot-nf4",
-        }
-        return stage_1_model[quantization_stage1]
-
-    def get_stage2_model(self, quantization_stage2: str) -> str:
-        stage_2_model = {
-            "bf16": "m-a-p/YuE-s2-1B-general",
-            "int8": "Alissonerdx/YuE-s2-1B-general-int8",
-        }
-        return stage_2_model[quantization_stage2]
