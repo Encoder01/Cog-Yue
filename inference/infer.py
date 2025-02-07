@@ -62,7 +62,6 @@ parser.add_argument("--icl", action="store_true")
 args = parser.parse_args()
 profile = args.profile
 compile = args.compile
-sdpa = args.sdpa
 use_icl = args.icl
 
 if use_icl:
@@ -79,11 +78,15 @@ args.output_dir= "./output"
 args.cuda_idx =  0
 args.max_new_tokens = 3000 
 
-if sdpa:
-    attn_implementation="sdpa"
-else:
-    attn_implementation="flash_attention_2"
-
+args.stage1_model="m-a-p/YuE-s1-7B-anneal-en-cot"
+args.stage2_model="m-a-p/YuE-s2-1B-general"
+args.genre_txt="prompt_examples/genrerock.txt"
+args.lyrics_txt="prompt_examples/lastxmas.txt"
+args.run_n_segments=2
+args.stage2_batch_size=12 if profile==1 else 4
+args.output_dir= "./output"
+args.cuda_idx =  0
+args.max_new_tokens = 3000 
 
 
 if args.use_audio_prompt and not args.audio_prompt_path:
@@ -112,7 +115,6 @@ mmtokenizer = _MMSentencePieceTokenizer("./mm_tokenizer_v0.2_hf/tokenizer.model"
 model = AutoModelForCausalLM.from_pretrained(
     stage1_model, 
     torch_dtype=torch.bfloat16,
-    attn_implementation=attn_implementation, # To enable flashattn, you have to install flash-attn
     )
 # to device, if gpu is available
 model.to("cpu")
@@ -121,7 +123,6 @@ model.eval()
 model_stage2 = AutoModelForCausalLM.from_pretrained(
     stage2_model, 
     torch_dtype=torch.float16,
-    attn_implementation=attn_implementation
     )
 model_stage2.to("cpu")
 model_stage2.eval()
